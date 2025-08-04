@@ -82,6 +82,7 @@ type WorkerPool struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
+	genWg      sync.WaitGroup // Add a separate WaitGroup for generateWork
 	target     string
 	cached     bool
 	rate       int
@@ -191,16 +192,19 @@ func (p *WorkerPool) Start() {
 	}
 	
 	// Start work generator
+	p.genWg.Add(1)
 	go p.generateWork()
 }
 
 func (p *WorkerPool) Stop() {
 	p.cancel()
+	p.genWg.Wait() // Wait for generateWork to finish
 	close(p.workChan)
 	p.wg.Wait()
 }
 
 func (p *WorkerPool) generateWork() {
+	defer p.genWg.Done()
 	ticker := time.NewTicker(time.Millisecond * 10) // Fast work generation
 	defer ticker.Stop()
 	
